@@ -1,0 +1,781 @@
+import React, { useState, useEffect } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInWithCustomToken, signInAnonymously, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, collection, addDoc, onSnapshot, doc, updateDoc, deleteDoc } from 'firebase/firestore';
+
+// Inicialización de la base de datos integrada de la plataforma (Automática y sin configurar)
+const firebaseConfig = JSON.parse(__firebase_config);
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+
+// Paleta de colores para los pósits según la categoría
+const CATEGORY_COLORS = {
+  'Emprendimiento': { bg: 'bg-amber-100 border-amber-300 text-amber-900', badge: 'bg-amber-500 text-white' },
+  'Metodología': { bg: 'bg-blue-100 border-blue-300 text-blue-900', badge: 'bg-blue-500 text-white' },
+  'Innovación': { bg: 'bg-emerald-100 border-emerald-300 text-emerald-900', badge: 'bg-emerald-500 text-white' },
+  'Integración de Módulos': { bg: 'bg-purple-100 border-purple-300 text-purple-900', badge: 'bg-purple-500 text-white' },
+  'Otros': { bg: 'bg-rose-100 border-rose-300 text-rose-900', badge: 'bg-rose-500 text-white' }
+};
+
+export default function App() {
+  const [user, setUser] = useState(null);
+  const [role, setRole] = useState('landing'); // 'landing', 'presenter', 'participant'
+  const [ideas, setIdeas] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  // URL base personalizada para solucionar problemas de red/sandbox en directo
+  const [customBaseUrl, setCustomBaseUrl] = useState('');
+
+  // Estados del Participante (Móvil)
+  const [ideaText, setIdeaText] = useState('');
+  const [authorName, setAuthorName] = useState('');
+  const [selectedCategory, setSelectedCategory] = useState('Innovación');
+  const [sentSuccess, setSentSuccess] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  // Estados del Ponente (Pantalla Grande)
+  const [zoomIdea, setZoomIdea] = useState(null);
+  const [filterCategory, setFilterCategory] = useState('Todos');
+  const [showQRModal, setShowQRModal] = useState(false);
+  const [showSimulator, setShowSimulator] = useState(false); // Simulador lateral de móvil
+
+  // Inicializar URL base por defecto
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      const base = window.location.origin + window.location.pathname;
+      setCustomBaseUrl(base);
+    }
+  }, []);
+
+  // Detección automática de rol mediante parámetros de URL (?role=participant o ?role=presenter)
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const urlRole = params.get('role');
+    if (urlRole === 'participant') {
+      setRole('participant');
+    } else if (urlRole === 'presenter') {
+      setRole('presenter');
+    }
+  }, []);
+
+  // Proceso de autenticación anónima y segura automática
+  useEffect(() => {
+    const initAuth = async () => {
+      try {
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+          await signInWithCustomToken(auth, __initial_auth_token);
+        } else {
+          await signInAnonymously(auth);
+        }
+      } catch (error) {
+        console.error("Error en la autenticación silenciosa:", error);
+      }
+    };
+    initAuth();
+    const unsubscribe = onAuthStateChanged(auth, setUser);
+    return () => unsubscribe();
+  }, []);
+
+  // Sincronización en tiempo real de los pósits de ideas
+  useEffect(() => {
+    if (!user) return;
+    setLoading(true);
+
+    const ideasCollection = collection(db, 'artifacts', appId, 'public', 'data', 'ideas');
+    
+    const unsubscribe = onSnapshot(ideasCollection, (snapshot) => {
+      const list = [];
+      snapshot.forEach((doc) => {
+        list.push({ id: doc.id, ...doc.data() });
+      });
+      // Ordenar localmente: más recientes primero
+      list.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+      setIdeas(list);
+      setLoading(false);
+    }, (error) => {
+      console.error("Error al leer ideas:", error);
+      setLoading(false);
+    });
+
+    return () => unsubscribe();
+  }, [user]);
+
+  // Generación dinámica del enlace de participación usando la URL personalizada
+  const getParticipantLink = () => {
+    const base = customBaseUrl || (window.location.origin + window.location.pathname);
+    const separator = base.includes('?') ? '&' : '?';
+    return `${base}${separator}role=participant`;
+  };
+
+  // Enlace para generar el código QR vía API pública segura
+  const getQRCodeUrl = () => {
+    return `https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${encodeURIComponent(getParticipantLink())}`;
+  };
+
+  // Función para enviar la idea a la base de datos (compartida por participante y simulador)
+  const submitIdeaToFirebase = async (text, author, category) => {
+    if (!text.trim()) return false;
+    const ideasCollection = collection(db, 'artifacts', appId, 'public', 'data', 'ideas');
+    await addDoc(ideasCollection, {
+      texto: text.trim(),
+      autor: author.trim() || 'Compi de FOL',
+      categoria: category,
+      timestamp: Date.now(),
+      destacada: false,
+      votos: 0
+    });
+    return true;
+  };
+
+  const handleSendIdea = async (e) => {
+    e.preventDefault();
+    setIsSubmitting(true);
+    try {
+      const success = await submitIdeaToFirebase(ideaText, authorName, selectedCategory);
+      if (success) {
+        setIdeaText('');
+        setSentSuccess(true);
+        setTimeout(() => setSentSuccess(false), 4000);
+      }
+    } catch (error) {
+      console.error("Error al enviar idea:", error);
+    } {
+      setIsSubmitting(false);
+    }
+  };
+
+  // Funciones de moderación para el ponente
+  const handleToggleHighlight = async (id, currentVal) => {
+    try {
+      const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'ideas', id);
+      await updateDoc(docRef, { destacada: !currentVal });
+    } catch (error) {
+      console.error("Error al destacar idea:", error);
+    }
+  };
+
+  const handleDeleteIdea = async (id) => {
+    if (confirm("¿Seguro que deseas eliminar esta aportación?")) {
+      try {
+        const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'ideas', id);
+        await deleteDoc(docRef);
+        if (zoomIdea?.id === id) setZoomIdea(null);
+      } catch (error) {
+        console.error("Error al borrar idea:", error);
+      }
+    }
+  };
+
+  const handleVoteIdea = async (id, currentVotes) => {
+    try {
+      const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'ideas', id);
+      await updateDoc(docRef, { votos: (currentVotes || 0) + 1 });
+    } catch (error) {
+      console.error("Error al votar idea:", error);
+    }
+  };
+
+  // Filtrado de ideas en el lado del cliente
+  const filteredIdeas = ideas.filter(idea => {
+    if (filterCategory === 'Todos') return true;
+    return idea.categoria === filterCategory;
+  });
+
+  // Componente del Simulador de Teléfono Móvil
+  const PhoneSimulator = () => {
+    const [simText, setSimText] = useState('');
+    const [simAuthor, setSimAuthor] = useState('');
+    const [simCategory, setSimCategory] = useState('Innovación');
+    const [simSuccess, setSimSuccess] = useState(false);
+
+    const handleSimSubmit = async (e) => {
+      e.preventDefault();
+      if (!simText.trim()) return;
+      try {
+        await submitIdeaToFirebase(simText, simAuthor || 'Docente Simulado', simCategory);
+        setSimText('');
+        setSimSuccess(true);
+        setTimeout(() => setSimSuccess(false), 3000);
+      } catch (err) {
+        console.error(err);
+      }
+    };
+
+    return (
+      <div className="w-80 bg-slate-950 border-l border-slate-800 p-4 flex flex-col justify-between shrink-0">
+        <div>
+          <div className="flex justify-between items-center mb-4">
+            <h3 className="text-sm font-bold text-teal-400 flex items-center space-x-1">
+              <span>📱</span> <span>Simulador de Móvil</span>
+            </h3>
+            <button 
+              onClick={() => setShowSimulator(false)} 
+              className="text-xs text-slate-400 hover:text-white bg-slate-800 px-2 py-1 rounded"
+            >
+              Cerrar
+            </button>
+          </div>
+          <p className="text-[11px] text-slate-400 mb-3 leading-relaxed">
+            Utiliza este panel para simular cómo un profesor envía ideas desde su teléfono móvil sin necesidad de usar un dispositivo real.
+          </p>
+
+          {simSuccess && (
+            <div className="bg-emerald-500/20 border border-emerald-500 text-emerald-300 text-xs p-2 rounded mb-3 text-center animate-pulse">
+              ¡Idea simulada enviada al panel!
+            </div>
+          )}
+
+          <form onSubmit={handleSimSubmit} className="space-y-3">
+            <div>
+              <label className="block text-[10px] text-slate-300 font-bold mb-1">Nombre del Profesor</label>
+              <input 
+                type="text" 
+                placeholder="Ej. Carlos (FOL)" 
+                value={simAuthor}
+                onChange={(e) => setSimAuthor(e.target.value)}
+                className="w-full bg-slate-900 border border-slate-700 rounded p-1.5 text-xs text-slate-200 outline-none focus:border-indigo-500"
+              />
+            </div>
+
+            <div>
+              <label className="block text-[10px] text-slate-300 font-bold mb-1">Enfoque (Categoría)</label>
+              <select 
+                value={simCategory} 
+                onChange={(e) => setSimCategory(e.target.value)}
+                className="w-full bg-slate-900 border border-slate-700 rounded p-1.5 text-xs text-slate-200 outline-none focus:border-indigo-500"
+              >
+                {Object.keys(CATEGORY_COLORS).map(cat => (
+                  <option key={cat} value={cat}>{cat}</option>
+                ))}
+              </select>
+            </div>
+
+            <div>
+              <label className="block text-[10px] text-slate-300 font-bold mb-1">Idea / Propuesta</label>
+              <textarea 
+                placeholder="Escribe la aportación..." 
+                value={simText}
+                onChange={(e) => setSimText(e.target.value)}
+                rows={3}
+                required
+                className="w-full bg-slate-900 border border-slate-700 rounded p-1.5 text-xs text-slate-200 outline-none focus:border-indigo-500 resize-none"
+              />
+            </div>
+
+            <button 
+              type="submit" 
+              className="w-full bg-teal-500 hover:bg-teal-600 text-slate-950 text-xs font-bold py-2 rounded transition"
+            >
+              Simular Envío de Idea
+            </button>
+          </form>
+        </div>
+        <div className="text-[10px] text-slate-500 border-t border-slate-800 pt-3 mt-3 text-center">
+          Perfecto para ensayar tu ponencia en local.
+        </div>
+      </div>
+    );
+  };
+
+  // VISTA 1: Selector de Rol inicial (Aterrizaje)
+  if (role === 'landing') {
+    return (
+      <div className="min-h-screen bg-gradient-to-tr from-slate-900 via-indigo-950 to-slate-900 flex flex-col justify-center items-center p-6 text-white">
+        <div className="max-w-2xl w-full text-center space-y-8 bg-white/5 backdrop-blur-md p-8 rounded-2xl border border-white/10 shadow-2xl">
+          <div className="space-y-3">
+            <span className="bg-indigo-500/20 text-indigo-300 text-xs font-semibold px-3 py-1 rounded-full border border-indigo-500/30 uppercase tracking-wider">
+              Congreso de FOL
+            </span>
+            <h1 className="text-3xl md:text-5xl font-black bg-gradient-to-r from-teal-300 via-cyan-200 to-indigo-400 bg-clip-text text-transparent">
+              Brainstorming Intermodular
+            </h1>
+            <p className="text-slate-300 text-sm md:text-base max-w-lg mx-auto">
+              Diseño metodológico, innovación y emprendimiento con SIMARED-FP.
+            </p>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-6 pt-4">
+            <button
+              onClick={() => setRole('presenter')}
+              className="p-6 bg-indigo-600/30 hover:bg-indigo-600/50 border border-indigo-500/30 hover:border-indigo-400 rounded-xl transition duration-300 text-left group flex flex-col justify-between h-48"
+            >
+              <div>
+                <span className="text-3xl">💻</span>
+                <h3 className="text-xl font-bold mt-3 text-white">Modo Proyector</h3>
+                <p className="text-slate-300 text-xs mt-1">Para mostrar en la pantalla del congreso. Genera el código QR de acceso y actualiza en tiempo real.</p>
+              </div>
+              <span className="text-indigo-400 font-medium text-sm group-hover:translate-x-1 transition duration-200">Iniciar panel &rarr;</span>
+            </button>
+
+            <button
+              onClick={() => setRole('participant')}
+              className="p-6 bg-teal-600/30 hover:bg-teal-600/50 border border-teal-500/30 hover:border-teal-400 rounded-xl transition duration-300 text-left group flex flex-col justify-between h-48"
+            >
+              <div>
+                <span className="text-3xl">📱</span>
+                <h3 className="text-xl font-bold mt-3 text-white">Modo Participante</h3>
+                <p className="text-slate-300 text-xs mt-1">Para que los docentes del público envíen ideas y soluciones desde sus teléfonos.</p>
+              </div>
+              <span className="text-teal-400 font-medium text-sm group-hover:translate-x-1 transition duration-200">Abrir formulario &rarr;</span>
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // VISTA 2: Participante (Pantalla del Móvil)
+  if (role === 'participant') {
+    return (
+      <div className="min-h-screen bg-slate-50 flex flex-col justify-between">
+        {/* Cabecera */}
+        <header className="bg-indigo-900 text-white p-4 shadow-md sticky top-0 z-10">
+          <div className="max-w-md mx-auto flex justify-between items-center">
+            <div className="flex items-center space-x-2">
+              <span className="text-xl">💡</span>
+              <div>
+                <h2 className="font-bold text-sm">Brainstorming FOL</h2>
+                <p className="text-xs text-indigo-200">Proyecto Intermodular & SIMARED-FP</p>
+              </div>
+            </div>
+            <button 
+              onClick={() => setRole('landing')}
+              className="text-xs bg-white/10 hover:bg-white/25 px-2.5 py-1.5 rounded-lg transition"
+            >
+              Inicio
+            </button>
+          </div>
+        </header>
+
+        {/* Cuerpo */}
+        <main className="flex-grow p-4 max-w-md w-full mx-auto space-y-4">
+          {/* El Desafío planteado */}
+          <div className="bg-indigo-50 border-l-4 border-indigo-500 p-4 rounded-r-xl shadow-sm">
+            <h3 className="text-indigo-950 font-bold text-xs uppercase tracking-wide mb-1">Tu Desafío</h3>
+            <p className="text-indigo-900 text-sm italic leading-relaxed">
+              "Soy docente técnica de un módulo técnico y tutora de 2º. ¿Cómo me aporta el departamento de FOL su visión para que el Proyecto Intermodular sea innovador, emprendedor e integre los conocimientos de los 2 cursos utilizando SIMARED-FP?"
+            </p>
+          </div>
+
+          {/* Éxito al enviar */}
+          {sentSuccess && (
+            <div className="bg-emerald-500 text-white p-4 rounded-xl shadow-md text-center animate-bounce flex items-center justify-center space-x-2">
+              <span>🎉</span>
+              <span className="font-medium">¡Tu idea se ha enviado al proyector con éxito!</span>
+            </div>
+          )}
+
+          {/* Formulario */}
+          <form onSubmit={handleSendIdea} className="bg-white p-5 rounded-2xl shadow-sm border border-slate-100 space-y-4">
+            <div>
+              <label className="block text-slate-700 font-semibold text-xs mb-1.5">Tu Nombre / Iniciales (Opcional)</label>
+              <input
+                type="text"
+                placeholder="Ej. María FOL / Anónimo"
+                value={authorName}
+                onChange={(e) => setAuthorName(e.target.value)}
+                maxLength={40}
+                className="w-full px-3 py-2 border border-slate-200 rounded-xl focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none transition text-sm text-slate-800"
+              />
+            </div>
+
+            <div>
+              <label className="block text-slate-700 font-semibold text-xs mb-1.5">Enfoque Principal (Categoría)</label>
+              <div className="grid grid-cols-2 gap-2">
+                {Object.keys(CATEGORY_COLORS).map((cat) => (
+                  <button
+                    key={cat}
+                    type="button"
+                    onClick={() => setSelectedCategory(cat)}
+                    className={`py-2 px-3 text-xs font-semibold rounded-xl border text-center transition ${
+                      selectedCategory === cat
+                        ? 'bg-indigo-600 border-indigo-600 text-white shadow-sm'
+                        : 'bg-white border-slate-200 text-slate-600 hover:bg-slate-50'
+                    }`}
+                  >
+                    {cat}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div>
+              <div className="flex justify-between items-center mb-1.5">
+                <label className="block text-slate-700 font-semibold text-xs">Aportación o Propuesta</label>
+                <span className={`text-xs ${ideaText.length > 250 ? 'text-amber-500' : 'text-slate-400'}`}>
+                  {ideaText.length}/300
+                </span>
+              </div>
+              <textarea
+                placeholder="¿Cómo organizarías el proyecto? ¿Qué ideas de emprendimiento o simulaciones de SIMARED propones?..."
+                value={ideaText}
+                onChange={(e) => setIdeaText(e.target.value)}
+                maxLength={300}
+                required
+                rows={4}
+                className="w-full px-3 py-2.5 border border-slate-200 rounded-xl focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none transition text-sm text-slate-800 resize-none"
+              ></textarea>
+            </div>
+
+            <button
+              type="submit"
+              disabled={isSubmitting || !ideaText.trim()}
+              className="w-full bg-gradient-to-r from-indigo-600 to-indigo-700 text-white font-bold py-3 rounded-xl hover:shadow-lg transition disabled:opacity-50 flex justify-center items-center space-x-2 text-sm"
+            >
+              {isSubmitting ? (
+                <>
+                  <span className="animate-spin rounded-full h-4 w-4 border-2 border-white border-t-transparent"></span>
+                  <span>Enviando...</span>
+                </>
+              ) : (
+                <>
+                  <span>🚀</span>
+                  <span>Enviar Idea al Proyector</span>
+                </>
+              )}
+            </button>
+          </form>
+        </main>
+
+        {/* Footer */}
+        <footer className="bg-slate-100 text-center py-4 border-t border-slate-200 text-[10px] text-slate-500">
+          Proyecto Intermodular & SIMARED-FP • Congreso de FOL
+        </footer>
+      </div>
+    );
+  }
+
+  // VISTA 3: Ponente (Para proyectar en la pantalla grande)
+  if (role === 'presenter') {
+    return (
+      <div className="min-h-screen bg-slate-900 text-white flex flex-col overflow-x-hidden">
+        {/* Barra superior de control */}
+        <header className="bg-slate-950 p-4 border-b border-slate-800 flex flex-wrap items-center justify-between gap-4 top-0 z-10 shadow-lg">
+          <div className="flex items-center space-x-3">
+            <span className="text-3xl">💡</span>
+            <div>
+              <div className="flex items-center space-x-2">
+                <h1 className="text-lg md:text-xl font-black bg-gradient-to-r from-amber-400 to-amber-200 bg-clip-text text-transparent">
+                  SIMARED-FP + Proyecto Intermodular desde FOL
+                </h1>
+                <span className="bg-indigo-600/30 text-indigo-300 border border-indigo-500/30 text-xs font-semibold px-2 py-0.5 rounded-full">
+                  Lluvia de Ideas en Vivo
+                </span>
+              </div>
+              <p className="text-xs text-slate-400">¿Cómo guiar al alumnado hacia una respuesta innovadora, integradora y con un matiz emprendedor?</p>
+            </div>
+          </div>
+
+          <div className="flex items-center space-x-2 flex-wrap gap-2">
+            {/* Filtros de Categoría */}
+            <div className="bg-slate-900 border border-slate-800 p-1 rounded-xl flex space-x-1">
+              {['Todos', ...Object.keys(CATEGORY_COLORS)].map((cat) => (
+                <button
+                  key={cat}
+                  onClick={() => setFilterCategory(cat)}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition ${
+                    filterCategory === cat
+                      ? 'bg-indigo-600 text-white shadow'
+                      : 'text-slate-400 hover:text-white hover:bg-slate-800'
+                  }`}
+                >
+                  {cat}
+                </button>
+              ))}
+            </div>
+
+            {/* Botón Simulador */}
+            <button
+              onClick={() => setShowSimulator(!showSimulator)}
+              className={`text-xs font-bold px-3 py-2.5 rounded-xl transition flex items-center space-x-1.5 ${
+                showSimulator ? 'bg-teal-500 text-slate-950' : 'bg-slate-800 hover:bg-slate-700 text-teal-400 border border-slate-700'
+              }`}
+            >
+              <span>📱 {showSimulator ? "Ocultar Simulador" : "Simular Teléfono"}</span>
+            </button>
+
+            {/* Botón QR */}
+            <button
+              onClick={() => setShowQRModal(true)}
+              className="bg-gradient-to-r from-indigo-500 to-cyan-500 text-white font-extrabold text-xs px-4 py-2.5 rounded-xl hover:shadow-lg hover:brightness-110 transition flex items-center space-x-1.5"
+            >
+              <span>⚙️ Configurar QR / Enlace</span>
+            </button>
+
+            {/* Cambiar Rol */}
+            <button
+              onClick={() => setRole('landing')}
+              className="bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-medium px-3 py-2.5 rounded-xl transition"
+            >
+              Cambiar Rol
+            </button>
+          </div>
+        </header>
+
+        {/* Panel con/sin simulador */}
+        <div className="flex flex-grow overflow-hidden">
+          {/* Panel principal */}
+          <main className="flex-grow p-6 relative overflow-y-auto">
+            {/* Aviso explicativo del porqué falla el QR en el sandbox */}
+            <div className="mb-4 bg-indigo-950/70 border border-indigo-500/30 p-4 rounded-xl text-xs space-y-2">
+              <p className="text-indigo-200 font-semibold flex items-center space-x-2">
+                <span>⚠️</span> <span>INFORMACIÓN CLAVE PARA TUS PRUEBAS EN DIRECTO</span>
+              </p>
+              <p className="text-slate-300 leading-relaxed">
+                El entorno de edición donde estás ahora es <strong>privado</strong>. Por eso, al escanear el código QR con tu móvil físico da error de acceso. 
+                Para tus ensayos de hoy, pulsa el botón de arriba de <strong>"📱 Simular Teléfono"</strong> para abrir un simulador a la derecha de la pantalla y añadir ideas ficticias tú misma, o pulsa abajo en <strong>"Probar en otra pestaña"</strong>. El día del congreso, cuando subas el archivo a internet (a tu servidor o una web pública), el QR funcionará perfectamente para tus 100 asistentes de forma automática.
+              </p>
+            </div>
+
+            {/* Instrucciones fijas arriba */}
+            <div className="mb-6 flex flex-col md:flex-row justify-between items-center gap-4 bg-slate-950/50 p-4 rounded-2xl border border-slate-800/80">
+              <div className="flex items-center space-x-4">
+                <div className="p-2 bg-indigo-500/10 border border-indigo-500/20 rounded-xl">
+                  <span className="text-2xl animate-pulse">🔥</span>
+                </div>
+                <div>
+                  <h3 className="text-sm font-bold text-indigo-300">¡Escribe tu idea para el Proyecto Intermodular desde FOL!</h3>
+                  <p className="text-xs text-slate-400">Escanea el código QR de la barra de herramientas para participar en tiempo real.</p>
+                </div>
+              </div>
+
+              {/* Enlace alternativo para probarlo de forma cómoda en tu mismo PC */}
+              <div className="flex items-center space-x-3 bg-slate-900 px-4 py-2 rounded-xl border border-slate-800">
+                <span className="text-xs text-slate-400 font-medium">Ensayar en tu PC:</span>
+                <a 
+                  href={getParticipantLink()} 
+                  target="_blank" 
+                  rel="noreferrer"
+                  className="text-xs font-bold text-teal-400 hover:text-teal-300 underline flex items-center space-x-1"
+                >
+                  <span>Probar en otra pestaña ↗</span>
+                </a>
+              </div>
+            </div>
+
+            {/* Estado de carga */}
+            {loading ? (
+              <div className="h-96 flex flex-col justify-center items-center space-y-3">
+                <div className="animate-spin rounded-full h-10 w-10 border-4 border-indigo-500 border-t-transparent"></div>
+                <p className="text-slate-400 text-sm">Cargando base de datos en tiempo real...</p>
+              </div>
+            ) : filteredIdeas.length === 0 ? (
+              <div className="h-96 flex flex-col justify-center items-center text-center max-w-md mx-auto space-y-4">
+                <div className="text-5xl">⏳</div>
+                <h2 className="text-xl font-bold text-slate-300">Esperando primeras ideas...</h2>
+                <p className="text-sm text-slate-500 leading-relaxed">
+                  ¡El panel está listo! Haz clic en <strong>"Simular Teléfono"</strong> arriba a la derecha para añadir ideas de prueba tú misma o abre una pestaña paralela para ensayar.
+                </p>
+                <div className="flex space-x-3">
+                  <button 
+                    onClick={() => setShowSimulator(true)}
+                    className="bg-teal-500 text-slate-950 text-xs font-bold px-4 py-2 rounded-lg"
+                  >
+                    Activar Simulador
+                  </button>
+                  <button 
+                    onClick={() => setShowQRModal(true)}
+                    className="bg-indigo-600 text-white text-xs font-semibold px-4 py-2 rounded-lg"
+                  >
+                    Ver QR del Congreso
+                  </button>
+                </div>
+              </div>
+            ) : (
+              /* Rejilla de ideas (Pósits) */
+              <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-6">
+                {filteredIdeas.map((idea) => {
+                  const style = CATEGORY_COLORS[idea.categoria] || CATEGORY_COLORS['Otros'];
+                  return (
+                    <div
+                      key={idea.id}
+                      className={`p-6 rounded-lg shadow-xl border-l-4 ${style.bg} transform hover:-translate-y-2 transition duration-300 flex flex-col justify-between h-64 relative overflow-hidden group`}
+                    >
+                      {/* Botones de moderación rápida */}
+                      <div className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition duration-200 flex space-x-1 z-10">
+                        <button
+                          onClick={() => handleToggleHighlight(idea.id, idea.destacada)}
+                          title="Destacar"
+                          className={`p-1.5 rounded-full ${idea.destacada ? 'bg-amber-400 text-slate-900' : 'bg-slate-800 text-white hover:bg-slate-700'}`}
+                        >
+                          ⭐
+                        </button>
+                        <button
+                          onClick={() => handleDeleteIdea(idea.id)}
+                          title="Borrar"
+                          className="p-1.5 bg-rose-600 text-white rounded-full hover:bg-rose-500"
+                        >
+                          🗑️
+                        </button>
+                      </div>
+
+                      <div>
+                        {/* Categoría y Nombre */}
+                        <div className="flex justify-between items-start mb-3">
+                          <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${style.badge}`}>
+                            {idea.categoria}
+                          </span>
+                          <span className="text-[10px] font-semibold text-slate-500 italic max-w-[120px] truncate">
+                            {idea.autor}
+                          </span>
+                        </div>
+
+                        {/* Texto de la idea */}
+                        <p className="text-sm md:text-base font-medium leading-relaxed line-clamp-5 whitespace-pre-line text-slate-900">
+                          "{idea.texto}"
+                        </p>
+                      </div>
+
+                      {/* Controles de interacción en la parte inferior */}
+                      <div className="border-t border-slate-200/50 pt-3 mt-3 flex justify-between items-center text-slate-800">
+                        <button
+                          onClick={() => handleVoteIdea(idea.id, idea.votos)}
+                          className="text-xs hover:text-indigo-600 flex items-center space-x-1 font-bold bg-white/40 hover:bg-white/80 px-2 py-1 rounded-md transition"
+                        >
+                          <span>👏 Apoyar</span>
+                          <span>({idea.votos || 0})</span>
+                        </button>
+                        <button
+                          onClick={() => setZoomIdea(idea)}
+                          className="text-xs hover:underline flex items-center space-x-1 text-slate-700 font-semibold"
+                        >
+                          <span>🔍 Enfocar</span>
+                        </button>
+                      </div>
+
+                      {idea.destacada && (
+                        <div className="absolute top-0 left-0 bg-amber-400 text-slate-950 text-[10px] font-extrabold px-3 py-0.5 rounded-br-lg shadow-sm">
+                          DESTACADA ⭐
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </main>
+
+          {/* Renderizado condicional del Simulador de Teléfono */}
+          {showSimulator && <PhoneSimulator />}
+        </div>
+
+        {/* Modal: Zoom en una idea para el debate */}
+        {zoomIdea && (
+          <div className="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex justify-center items-center p-4">
+            <div className={`max-w-3xl w-full p-8 md:p-12 rounded-2xl shadow-2xl border ${CATEGORY_COLORS[zoomIdea.categoria]?.bg} relative transform scale-100 transition duration-300 flex flex-col justify-between min-h-[400px]`}>
+              <button
+                onClick={() => setZoomIdea(null)}
+                className="absolute top-4 right-4 text-2xl font-bold text-slate-700 hover:text-slate-950 bg-white/40 hover:bg-white/80 rounded-full w-10 h-10 flex items-center justify-center transition"
+              >
+                ✕
+              </button>
+
+              <div>
+                <div className="flex justify-between items-center mb-6">
+                  <span className={`text-xs font-bold px-3 py-1 rounded-full ${CATEGORY_COLORS[zoomIdea.categoria]?.badge}`}>
+                    {zoomIdea.categoria}
+                  </span>
+                  <span className="text-sm font-semibold text-slate-600 italic">
+                    Propuesta de: {zoomIdea.autor}
+                  </span>
+                </div>
+
+                <p className="text-xl md:text-3xl font-black text-slate-950 leading-relaxed italic whitespace-pre-line">
+                  "{zoomIdea.texto}"
+                </p>
+              </div>
+
+              <div className="border-t border-slate-300 pt-6 mt-6 flex justify-between items-center text-slate-900">
+                <button
+                  onClick={() => handleVoteIdea(zoomIdea.id, zoomIdea.votos)}
+                  className="bg-white hover:bg-slate-100 px-4 py-2 rounded-xl text-sm font-bold shadow transition flex items-center space-x-2"
+                >
+                  <span className="text-xl">👏 Apoyar esta idea</span>
+                  <span>({zoomIdea.votos || 0})</span>
+                </button>
+                <span className="text-xs text-slate-500 font-semibold">Pulsa en la cruz o fuera para volver al tablón general</span>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Modal: QR de gran tamaño para el proyector */}
+        {showQRModal && (
+          <div className="fixed inset-0 bg-slate-950/90 backdrop-blur-md z-50 flex justify-center items-center p-4">
+            <div className="bg-white p-8 rounded-3xl max-w-lg w-full shadow-2xl text-slate-900 text-center space-y-6 relative border border-slate-100">
+              <button
+                onClick={() => setShowQRModal(false)}
+                className="absolute top-4 right-4 text-xl font-bold text-slate-400 hover:text-slate-900 transition"
+              >
+                ✕
+              </button>
+
+              <div className="space-y-2">
+                <span className="bg-indigo-100 text-indigo-700 text-xs font-extrabold px-3 py-1 rounded-full uppercase tracking-wider">
+                  Configuración del Código QR
+                </span>
+                <h3 className="text-2xl font-black text-slate-900">Lluvia de Ideas en Vivo</h3>
+                <p className="text-xs text-slate-500">Apunta con la cámara de tu móvil para abrir el panel de envío.</p>
+              </div>
+
+              {/* Ajustar URL en caliente por si falla */}
+              <div className="text-left bg-slate-50 p-3 rounded-xl border border-slate-200">
+                <label className="block text-[10px] font-bold text-slate-500 uppercase mb-1">Dirección Web de tu Congreso:</label>
+                <input 
+                  type="text" 
+                  value={customBaseUrl} 
+                  onChange={(e) => setCustomBaseUrl(e.target.value)}
+                  className="w-full bg-white border border-slate-300 rounded p-1.5 text-xs text-slate-800 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                  placeholder="Ej: https://mi-sitio-real.com"
+                />
+                <p className="text-[9px] text-slate-400 mt-1">
+                  * Pon aquí la URL pública de tu web para que tus 100 asistentes puedan escanearla e interactuar con sus móviles.
+                </p>
+              </div>
+
+              {/* Código QR generado dinámicamente */}
+              <div className="bg-slate-50 p-4 rounded-2xl flex justify-center items-center border border-slate-100">
+                <img
+                  src={getQRCodeUrl()}
+                  alt="Escanea este código QR"
+                  className="w-60 h-60 rounded-lg object-contain shadow-sm"
+                  onError={(e) => {
+                    e.target.onerror = null;
+                    e.target.src = "https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=https://example.com";
+                  }}
+                />
+              </div>
+
+              <div className="space-y-1">
+                <p className="text-xs text-slate-400">Enlace directo:</p>
+                <a 
+                  href={getParticipantLink()}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="text-xs font-bold text-indigo-600 select-all underline break-all hover:text-indigo-800"
+                >
+                  {getParticipantLink()}
+                </a>
+              </div>
+
+              <button
+                onClick={() => setShowQRModal(false)}
+                className="w-full bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-bold py-3 rounded-xl transition shadow-lg"
+              >
+                Listo, volver al tablón
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Footer */}
+        <footer className="bg-slate-950 border-t border-slate-800 p-4 text-center text-xs text-slate-500 flex justify-between items-center px-8">
+          <span>Congreso de FOL • SIMARED-FP • Proyecto Intermodular</span>
+          <span>Actualizado en tiempo real</span>
+        </footer>
+      </div>
+    );
+  }
+}
